@@ -1,0 +1,15 @@
+{
+    "name": "jaysonegarcia/webp-convert",
+    "description": "A WordPress plugin that automatically converts JPEG and PNG uploads to WebP, reducing image file sizes by up to 90% while keeping your site visually identical. Built to work seamlessly with W3 Total Cache + CloudFront (S3 push) CDN setups.",
+    "homepage": "https://github.com/jaysonegarcia/webp-convert",
+    "authors": [
+        {
+        "name": "Jayson Garcia",
+        "homepage": "https://github.com/jaysonegarcia"
+        }
+    ],
+    "type": "wordpress-plugin",
+    "require": {
+        "php": ">=8.0"
+    }
+}
