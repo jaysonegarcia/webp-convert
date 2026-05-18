@@ -16,7 +16,7 @@ A WordPress plugin that automatically converts JPEG and PNG uploads to WebP, red
 
 - WordPress 6.0+
 - PHP 8.0+
-- GD or Imagick with WebP support (PHP 7.0+ includes GD WebP by default)
+- GD or Imagick with WebP support (PHP 8.0+ includes GD WebP by default)
 - Optional: W3 Total Cache with CDN enabled, for S3/CloudFront push sync
 
 ## Installation

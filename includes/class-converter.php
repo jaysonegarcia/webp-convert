@@ -222,8 +222,16 @@ class WebP_Convert_Converter
     private function convert_file(string $source): ?string
     {
         $target = WebP_Convert_Paths::webp_path_for($source);
-        if (file_exists($target)) {
+        if (file_exists($target) && filesize($target) > 0) {
             return $target;
+        }
+
+        // GD's imagewebp() throws "Palette image not supported by webp" on
+        // indexed-color PNGs, which fatals the request. Detect via the IHDR
+        // color-type byte and promote to truecolor through raw GD instead of
+        // going through WP_Image_Editor_GD.
+        if ($this->is_palette_png($source)) {
+            return $this->convert_palette_png($source, $target);
         }
 
         $editor = wp_get_image_editor($source);
@@ -238,6 +246,48 @@ class WebP_Convert_Converter
         }
 
         return $saved['path'];
+    }
+
+    private function is_palette_png(string $file): bool
+    {
+        if (!preg_match('/\.png$/i', $file)) {
+            return false;
+        }
+        $fh = @fopen($file, 'rb');
+        if (!$fh) {
+            return false;
+        }
+        $head = fread($fh, 26);
+        fclose($fh);
+        // PNG signature (8) + IHDR length/type (8) + width (4) + height (4)
+        // + bit depth (1) + color type (1) — color type lives at offset 25.
+        // Type 3 = indexed/palette.
+        return is_string($head) && strlen($head) >= 26 && ord($head[25]) === 3;
+    }
+
+    private function convert_palette_png(string $source, string $target): ?string
+    {
+        if (!function_exists('imagecreatefrompng') || !function_exists('imagewebp')) {
+            return null;
+        }
+        $image = @imagecreatefrompng($source);
+        if (!$image) {
+            return null;
+        }
+        if (function_exists('imagepalettetotruecolor')) {
+            imagepalettetotruecolor($image);
+        }
+        imagealphablending($image, false);
+        imagesavealpha($image, true);
+        $ok = @imagewebp($image, $target, $this->settings->quality());
+        imagedestroy($image);
+        if (!$ok || !file_exists($target) || filesize($target) === 0) {
+            if (file_exists($target)) {
+                @unlink($target);
+            }
+            return null;
+        }
+        return $target;
     }
 
     private function is_animated_png(string $file): bool
