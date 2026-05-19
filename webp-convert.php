@@ -4,7 +4,7 @@
  * Description:       A WordPress plugin that automatically converts JPEG and PNG uploads to WebP, reducing image file sizes by up to 90% while keeping your site visually identical. Built to work seamlessly with W3 Total Cache + CloudFront (S3 push) CDN setups.
  * Version:           1.0.2
  * Requires at least: 5.8
- * Requires PHP:      7.4
+ * Requires PHP:      8.0
  * License:           GPL v2 or later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       webp-convert
