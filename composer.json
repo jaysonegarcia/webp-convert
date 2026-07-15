@@ -4,12 +4,24 @@
     "homepage": "https://github.com/jaysonegarcia/webp-convert",
     "authors": [
         {
-        "name": "Jayson Garcia",
-        "homepage": "https://github.com/jaysonegarcia"
+            "name": "Jayson Garcia",
+            "homepage": "https://github.com/jaysonegarcia"
         }
     ],
     "type": "wordpress-plugin",
     "require": {
-        "php": ">=8.0"
+        "php": ">=8.0",
+        "aws/aws-sdk-php": "^3.0"
+    },
+    "scripts": {
+        "pre-autoload-dump": "Aws\\Script\\Composer\\Composer::removeUnusedServices"
+    },
+    "extra": {
+        "aws/aws-sdk-php": [
+            "CloudFront"
+        ]
+    },
+    "config": {
+        "optimize-autoloader": true
     }
 }

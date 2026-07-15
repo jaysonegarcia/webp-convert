@@ -6,21 +6,23 @@ Plugin that converts Media Library JPEG/PNG uploads to WebP, serves the `.webp` 
 
 ```
 webp-convert/
-├── webp-convert.php           # plugin header + bootstrap (requires includes/, news up Plugin, register hooks on plugins_loaded)
+├── webp-convert.php     # plugin header + bootstrap (requires includes/, news up Plugin, register hooks on plugins_loaded)
 ├── includes/
 │   ├── class-paths.php        # WebP_Convert_Paths           — static path/URL helpers (webp_path_for, webp_url_for, is_convertible_url)
 │   ├── class-settings.php     # WebP_Convert_Settings        — option storage, defaults, sanitization, settings page render
 │   ├── class-w3tc-integration.php # WebP_Convert_W3TC_Integration — CDN filters + explicit upload/delete; no-ops without W3TC
-│   ├── class-converter.php    # WebP_Convert_Converter       — conversion engine + replace-originals + delete_attachment cleanup
+│   ├── class-cdn-invalidator.php # WebP_Convert_CDN_Invalidator — CloudFront CreateInvalidation; env-over-option config; no-ops without SDK/config
+│   ├── class-converter.php    # WebP_Convert_Converter       — conversion engine + replace-originals + regenerate + delete_attachment cleanup
 │   ├── class-url-rewriter.php # WebP_Convert_URL_Rewriter    — front-end .jpg/.png → .webp swapping (sibling mode)
-│   ├── class-admin-pages.php  # WebP_Convert_Admin_Pages     — menu, Manual Converter page, row/bulk actions, notices
+│   ├── class-admin-pages.php  # WebP_Convert_Admin_Pages     — menu, Manual Converter + Regenerate pages, row/bulk actions, notices
 │   └── class-plugin.php       # WebP_Convert_Plugin          — orchestrator; builds subsystems and calls register_hooks()
 └── CLAUDE.md / README.md / CHANGELOG.md
 ```
 
 Dependencies (constructor-injected):
-- `Converter ← Settings, W3TC_Integration`
-- `Admin_Pages ← Settings, Converter`
+- `Converter ← Settings, W3TC_Integration, CDN_Invalidator`
+- `Admin_Pages ← Settings, Converter, CDN_Invalidator`
+- `CDN_Invalidator ← Settings`
 - `URL_Rewriter`, `W3TC_Integration`, `Settings` — no deps (W3TC/URL_Rewriter reach into `Paths` statics)
 
 ## Settings
@@ -32,23 +34,38 @@ Stored as a single option `webp_convert_settings` (see `WebP_Convert_Settings::O
     'auto_convert_enabled' => true,                // toggle auto-convert on upload
     'file_types'           => ['jpg','jpeg','png'], // which mimes are eligible
     'quality'              => 80,                   // 1–100, clamped server-side
+    'cdn_enabled'          => false,               // CloudFront invalidation master toggle
+    'cdn_access_key'       => '',                  // AWS access key id
+    'cdn_secret_key'       => '',                  // AWS secret (masked in UI; blank submit keeps value)
+    'cdn_distribution_id'  => '',                  // CloudFront distribution id
+    'cdn_region'           => 'us-east-1',         // AWS client region
 ]
 ```
 
-Admin UI lives under a top-level menu **WebP** (registered in `Admin_Pages::register_menu_pages()`):
+The four **credential** `cdn_*` values have a matching env/constant that **overrides**
+them when set (read via `WebP_Convert_CDN_Invalidator::env()`):
+`WEBP_CDN_AWS_ACCESS_KEY_ID`, `WEBP_CDN_AWS_SECRET_ACCESS_KEY`,
+`WEBP_CDN_DISTRIBUTION_ID`, `WEBP_CDN_AWS_REGION`. Overridden fields render
+disabled with a "Set via .env / wp-config.php" note; a master-toggle JS show/hides the
+credential rows. **`cdn_enabled` is deliberately NOT env-overridable** — the on/off
+switch is admin-controlled (stored option) so it can always be toggled from the screen;
+there is no `WEBP_CDN_ENABLED` var.
+
+Admin UI lives under a top-level menu **WebP Convert** (registered in `Admin_Pages::register_menu_pages()`):
 - **Settings** → `admin.php?page=webp-convert` → `Settings::render_settings_page()`
 - **Manual Converter** → `admin.php?page=webp-manual` → `Admin_Pages::render_manual_converter_page()`
+- **Regenerate WebP** → `admin.php?page=webp-regenerate` → `Admin_Pages::render_regenerate_page()`
 
-The Manual Converter queries `WP_Query` with `post_mime_type => Settings::get_convertible_mimes()`, so it automatically filters by the file-types setting. In replace mode, converted images become `image/webp` and drop out of the list.
+The Manual Converter queries `WP_Query` with `post_mime_type => Settings::get_convertible_mimes()`, so it automatically filters by the file-types setting. In replace mode, converted images become `image/webp` and drop out of the list — and into the Regenerate page, which queries `post_mime_type => 'image/webp'`.
 
 ## Behavior modes
 
-**Replace mode** (default, controllable via filter `webp_convert_replace_originals`):
+**Replace mode** (default, controllable via filter `webp_replace_originals`):
 - On conversion, rewrites `_wp_attached_file`, `post_mime_type` → `image/webp`, and metadata `file`/`sizes[].file` → `.webp`.
 - Deletes original JPEG/PNG from disk **and** from W3TC CDN.
 - Front-end URL swap filters become no-ops since WP itself now serves `.webp`.
 
-**Sibling mode** (`webp_convert_replace_originals` returns false):
+**Sibling mode** (`webp_replace_originals` returns false):
 - Originals kept on disk and CDN; `.webp` siblings sit alongside.
 - URL swap at render time via `wp_get_attachment_image_src`, `wp_calculate_image_srcset`, `wp_content_img_tag` (all at priority 9 so the theme's CDN rewrite at priority 10 runs after).
 
@@ -56,8 +73,10 @@ The Manual Converter queries `WP_Query` with `post_mime_type => Settings::get_co
 
 - `Converter::on_generate_metadata` — filter `wp_generate_attachment_metadata` priority 20. Respects `auto_convert_enabled`.
 - `Converter::manual_convert($id)` — used by both the Media Library row action and the Manual Converter page (bulk + per-row). Always runs regardless of the auto-convert toggle.
-- `Admin_Pages::handle_row_action` — hooked on `admin_action_convert_webp` (GET + nonce flow).
-- `Admin_Pages::maybe_handle_manual_convert` — hooked on `load-{manual_hook}` so redirects fire before any output.
+- `Converter::regenerate_attachment($id)` — re-encodes an already-`image/webp` attachment (full + sizes) in place at the current quality, then re-pushes to the CDN. Used by the Regenerate page and the Media Library "Regenerate WebP" row/bulk actions.
+- `Admin_Pages::handle_row_action` / `handle_regenerate_row_action` — hooked on `admin_action_convert_webp` / `admin_action_regenerate_webp` (GET + nonce flow).
+- `Admin_Pages::maybe_handle_manual_convert` / `maybe_handle_regenerate` — hooked on `load-{hook}` so redirects fire before any output.
+- AJAX: `wp_ajax_webp_convert_one` / `wp_ajax_webp_regenerate_one` — one attachment per request, driving the shared progress UI (`Admin_Pages::print_batch_progress_script()`).
 
 ## W3TC CDN integration (engine `cf` = CloudFront + S3 push)
 
@@ -69,6 +88,19 @@ All W3TC code lives in `WebP_Convert_W3TC_Integration`. W3TC only knows about fi
 
 All W3TC calls are guarded by `class_exists('\W3TC\Dispatcher')` and no-op if W3TC is absent (see `cdn_core()`).
 
+## CloudFront cache invalidation (`WebP_Convert_CDN_Invalidator`)
+
+W3TC overwrites the `.webp` object in S3, but CloudFront edges keep serving the prior copy until TTL — most visible after a **Regenerate** (same key re-encoded). The invalidator closes that gap by issuing `CreateInvalidation` for the changed paths.
+
+- **Config resolution precedence (credentials only): env var → wp-config.php constant → stored option.** `env()` is a static helper: reads `getenv()` first (Bedrock `.env`), then falls back to a PHP `constant()` of the same name (`define()` in `wp-config.php` on classic WP), trims, returns null when empty. `Settings::render_settings_page()` calls it to render overridden fields disabled — no instance dependency, avoids a `Settings ↔ Invalidator` cycle. The settings screen includes a `<details>` block documenting the credential keys + `.env` / `wp-config.php` snippets. `is_enabled()` reads the DB option only (never env), so the toggle is never locked.
+- **`is_ready()` gates everything:** enabled + access key + secret + distribution id + `class_exists('\Aws\CloudFront\CloudFrontClient')`. Every public action no-ops when not ready — same defensive style as the W3TC guard. The plugin works fine without the AWS SDK installed.
+- **Path derivation** (`webp_url_paths_for_attachment`) mirrors the W3TC relative-path logic but emits **origin-relative URL paths** (path component of `wp_get_upload_dir()['baseurl']`, e.g. `/app/uploads/2024/06/x.webp`) — CloudFront invalidation paths are host-agnostic, matching how the theme `Cdn.php` swaps only the host.
+- **Trigger — Regenerate only:** `Converter::regenerate_attachment()` calls `invalidate_attachment()`, batching that one attachment's files into a single invalidation. Regenerate re-encodes an *existing* (already edge-cached) object at the same key, so it's the only path that needs busting — a fresh convert/upload isn't cached yet. `Admin_Pages` also adds an **Invalidate CloudFront now (/\*)** button (`admin_action_webp_invalidate_cdn`, nonce'd) on the Regenerate page calling `invalidate_all()`.
+- **Errors never fail a conversion:** `invalidate_paths()` wraps the API call in try/catch → `error_log`. A bulk Regenerate issues one invalidation per image (CloudFront free tier: 1000 paths/month) — the `/*` button is the cheap post-bulk escape hatch.
+- **Two setup gotchas that both surface as `403` (config, not code — see README "Required IAM permission"):** (1) the IAM user needs the `cloudfront:CreateInvalidation` action — a `cloudfront:Get*` + `cloudfront:List*` policy does NOT cover it, so `ListDistributions` succeeds while `CreateInvalidation` 403s; (2) `WEBP_CDN_DISTRIBUTION_ID` must be the distribution ID (`E...`), not the `*.cloudfront.net` domain label. Because failures only hit `error_log`, diagnose via `web/app/debug.log` (`grep webp-convert`).
+- **Dependency: bundled, CloudFront-only AWS SDK.** The plugin ships its own `vendor/` built from the plugin's `composer.json`, slimmed to just CloudFront via the SDK's `Aws\Script\Composer\Composer::removeUnusedServices` script (`extra.aws/aws-sdk-php: ["CloudFront"]`) → ~9 MB instead of 60 MB. The bootstrap loads `vendor/autoload.php` only when no AWS SDK is already present (`class_exists` check) and PHP ≥ 8.1 (the modern SDK needs 8.1; on older PHP the feature stays inert instead of fataling). It is NOT declared in the site's root `composer.json`. **The slim `vendor/` must be committed to the plugin's own repo** so it ships inside the SatisPress package (SatisPress distributes the plugin's files, and does not resolve the plugin's composer deps into the host site's root vendor). To update the SDK: `composer --working-dir=web/app/plugins/webp-convert update`.
+- **Test:** `tests/test-cdn-invalidator.php` is a standalone script (stubs the WP/AWS surface) — run with `docker compose exec -T php php web/app/plugins/webp-convert/tests/test-cdn-invalidator.php`. There is no WP PHPUnit harness in this repo.
+
 ## Critical lesson: use `update_attached_file()` not raw `update_post_meta`
 
 In replace mode we rewrite `_wp_attached_file` from `.jpg` to `.webp` (inside `Converter::replace_originals_with_webp()`). **Must** use WP's `update_attached_file($id, $path)` helper — it fires the `update_attached_file` filter, which is how W3TC detects the change and pushes the new full-size file to S3.
@@ -76,6 +108,22 @@ In replace mode we rewrite `_wp_attached_file` from `.jpg` to `.webp` (inside `C
 Raw `update_post_meta($id, '_wp_attached_file', ...)` bypasses the filter → W3TC uploads only the thumbnail sizes (via `wp_update_attachment_metadata`) and the main `.webp` never reaches S3 → CloudFront returns S3 `AccessDenied`.
 
 The sized thumbnails are pushed by W3TC via `wp_update_attachment_metadata` → `get_metadata_files()` — that path uses the modified metadata returned from `Converter::on_generate_metadata`, so sizes just work.
+
+## Critical lesson: quality must go through the `wp_editor_set_quality` filter
+
+All WebP writes go through `Converter::save_webp($editor, $target, $quality)`. **Do not** rely on `$editor->set_quality()` alone. The editor is created from a JPEG/PNG *source*, so `set_quality()` runs against the source mime — for JPEG it even forces `COMPRESSION_JPEG` — and when WordPress then writes the `.webp` it applies its own default quality and **discards** the value passed to `set_quality()`. The result is identical file sizes no matter what the user sets.
+
+`save_webp()` works around this by adding a `wp_editor_set_quality` filter (returning the configured quality for `image/webp`) for the duration of the save. That filter feeds the value WordPress actually uses when encoding WebP, so the Quality setting is honored regardless of the source format. This holds on both the Imagick and GD editors. Verified empirically: a 207 KB JPEG produced byte-identical WebP across quality 30/50/80/95 before the fix, and correctly varying sizes after.
+
+## Regenerate (re-encode existing WebP at a new quality)
+
+`Converter::regenerate_attachment($id)` re-encodes an attachment whose attached file is already `.webp` (replace-mode output) at the current quality. It collects the full-size file plus every `.webp` thumbnail from metadata and runs each through `reencode_webp_in_place()`, then calls `W3TC_Integration::push_attachment_to_cdn()` (overwrite) — which already resolves the correct `.webp` paths for a webp attachment.
+
+`reencode_webp_in_place($path, $quality)` encodes to a `.regen.webp` temp sibling via `encode_webp_lossy()`, then atomically renames over the original, so a failed or partial encode never truncates the live file. Missing-on-disk files are skipped; if nothing was re-encoded the method returns false (the UI then reports failure).
+
+**Critical lesson: regenerate must NOT go through `WP_Image_Editor` / `save_webp()`.** If the *source* WebP is lossless (`wp_get_webp_info() === 'lossless'`), `WP_Image_Editor_Imagick::set_quality()` force-sets quality 100 + `webp:lossless` and **discards the requested quality** — so lowering the Quality setting and regenerating does nothing (file size unchanged). This bites because a conversion done at quality 100 (or a flat image) can produce a lossless VP8L file, and every regenerate then reads that lossless source. `reencode_webp_in_place()` therefore calls **`encode_webp_lossy($source, $target, $quality)`**, which encodes directly (bypassing the WP editor) and forces lossy: **GD first** (`imagecreatefromwebp` + `imagewebp`, always lossy — and production runs GD, not Imagick), Imagick fallback (`setOption('webp:lossless','false')` + `setImageCompressionQuality`). Verified: a lossless 4298 B file regenerated at quality 10 → 2436 B lossy (`VP8 `). Test: `tests/test-regenerate-quality.php`. (Note: `save_webp()` is still correct for the *conversion* path — its source is JPEG/PNG, so the lossless branch never triggers there.)
+
+**One-directional quality:** because replace mode deleted the original JPEG/PNG, regeneration reads from the already-lossy WebP. Lowering quality shrinks files; raising it cannot restore lost detail. The Regenerate page states this in a warning notice. If true re-quality-up is ever needed, the source image must be re-uploaded — consider keeping originals (sibling mode) for libraries that will need it.
 
 ## Front-end URL swapping (sibling mode)
 
@@ -111,8 +159,8 @@ SVG is exposed in the UI but `wp_get_image_editor` can't open SVGs without librs
 
 ## Filters for consumers
 
-- `webp_convert_quality` (int) — override UI quality (applied last in `Settings::quality()`, wins over settings).
-- `webp_convert_replace_originals` (bool) — return false to opt out of replace mode (read in `Converter::should_replace_originals()`).
+- `webp_quality` (int) — override UI quality (applied last in `Settings::quality()`, wins over settings).
+- `webp_replace_originals` (bool) — return false to opt out of replace mode (read in `Converter::should_replace_originals()`).
 
 ## When working on this plugin
 
@@ -122,4 +170,5 @@ SVG is exposed in the UI but `wp_get_image_editor` can't open SVGs without librs
 - Defaults are merged in `Settings::get_settings()` at read time, so no activation hook is needed to seed options.
 - Preserve the W3TC integration path ordering described above when refactoring conversion flow.
 - New settings: add to `Settings::get_default_settings()`, `Settings::sanitize_settings()`, and `Settings::render_settings_page()`. Stored as one option, not individual options.
-- New admin pages: add to `Admin_Pages::register_menu_pages()`. Keep pagination helpers (`render_tablenav_pages`, `render_pagination_button`) reusable if you add another list page.
+- New admin pages: add to `Admin_Pages::register_menu_pages()`. Reuse the shared list-page helpers — `render_tablenav_pages($query, $paged, $slug)` for pagination and `print_batch_progress_script(...)` for the one-at-a-time AJAX progress UI (Manual Converter and Regenerate both drive it; only the slug, ajax action, labels, and result query-args differ).
+- All WebP encoding must go through `Converter::save_webp()` so the quality fix stays centralized — don't call `$editor->save(..., 'image/webp')` directly.

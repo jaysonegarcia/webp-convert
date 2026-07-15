@@ -13,8 +13,9 @@ if (!defined('ABSPATH')) {
  */
 class WebP_Convert_Admin_Pages
 {
-    const PARENT_SLUG = 'webp-convert';
-    const MANUAL_SLUG = 'webp-manual';
+    public const PARENT_SLUG = 'webp-convert';
+    public const MANUAL_SLUG = 'webp-manual';
+    public const REGEN_SLUG  = 'webp-regenerate';
 
     /** @var WebP_Convert_Settings */
     private $settings;
@@ -24,7 +25,7 @@ class WebP_Convert_Admin_Pages
 
     public function __construct(
         WebP_Convert_Settings $settings,
-        WebP_Convert_Converter $converter
+        WebP_Convert_Converter $converter,
     ) {
         $this->settings  = $settings;
         $this->converter = $converter;
@@ -39,6 +40,11 @@ class WebP_Convert_Admin_Pages
         add_filter('handle_bulk_actions-upload', [$this, 'handle_bulk_action'], 10, 3);
         add_action('admin_notices', [$this, 'bulk_notice']);
         add_action('wp_ajax_webp_convert_one', [$this, 'ajax_convert_one']);
+
+        add_action('admin_action_regenerate_webp', [$this, 'handle_regenerate_row_action']);
+        add_filter('handle_bulk_actions-upload', [$this, 'handle_regenerate_bulk_action'], 10, 3);
+        add_action('admin_notices', [$this, 'regenerate_notice']);
+        add_action('wp_ajax_webp_regenerate_one', [$this, 'ajax_regenerate_one']);
     }
 
     /**
@@ -79,12 +85,12 @@ class WebP_Convert_Admin_Pages
     {
         add_menu_page(
             __('WebP Converter', 'webp-convert'),
-            __('WebP', 'webp-convert'),
+            __('WebP Convert', 'webp-convert'),
             'manage_options',
             self::PARENT_SLUG,
             [$this->settings, 'render_settings_page'],
             'dashicons-format-image',
-            81
+            81,
         );
 
         add_submenu_page(
@@ -93,7 +99,7 @@ class WebP_Convert_Admin_Pages
             __('Settings', 'webp-convert'),
             'manage_options',
             self::PARENT_SLUG,
-            [$this->settings, 'render_settings_page']
+            [$this->settings, 'render_settings_page'],
         );
 
         $manual_hook = add_submenu_page(
@@ -102,11 +108,24 @@ class WebP_Convert_Admin_Pages
             __('Manual Converter', 'webp-convert'),
             'upload_files',
             self::MANUAL_SLUG,
-            [$this, 'render_manual_converter_page']
+            [$this, 'render_manual_converter_page'],
         );
 
         if ($manual_hook) {
             add_action('load-' . $manual_hook, [$this, 'maybe_handle_manual_convert']);
+        }
+
+        $regen_hook = add_submenu_page(
+            self::PARENT_SLUG,
+            __('Regenerate WebP', 'webp-convert'),
+            __('Regenerate WebP', 'webp-convert'),
+            'upload_files',
+            self::REGEN_SLUG,
+            [$this, 'render_regenerate_page'],
+        );
+
+        if ($regen_hook) {
+            add_action('load-' . $regen_hook, [$this, 'maybe_handle_regenerate']);
         }
     }
 
@@ -145,7 +164,7 @@ class WebP_Convert_Admin_Pages
                 'webp_converted' => 1,
                 'webp_count'     => $count,
             ],
-            admin_url('admin.php')
+            admin_url('admin.php'),
         ));
         exit;
     }
@@ -162,14 +181,14 @@ class WebP_Convert_Admin_Pages
         $per_page = 20;
 
         echo '<div class="wrap">';
-        echo '<h1>' . esc_html__('WebP — Manual Converter', 'webp-convert') . '</h1>';
+        echo '<h1>' . esc_html__('WebP Convert — Manual Converter', 'webp-convert') . '</h1>';
 
         if (empty($mimes)) {
             echo '<div class="notice notice-warning"><p>';
             printf(
                 /* translators: %s: settings page link */
                 esc_html__('No file types are enabled. Enable at least one in %s.', 'webp-convert'),
-                '<a href="' . esc_url(admin_url('admin.php?page=' . self::PARENT_SLUG)) . '">' . esc_html__('Settings', 'webp-convert') . '</a>'
+                '<a href="' . esc_url(admin_url('admin.php?page=' . self::PARENT_SLUG)) . '">' . esc_html__('Settings', 'webp-convert') . '</a>',
             );
             echo '</p></div></div>';
             return;
@@ -178,7 +197,7 @@ class WebP_Convert_Admin_Pages
         echo '<p>' . sprintf(
             /* translators: %s: comma-separated list of file type labels (e.g. "JPG, PNG") */
             esc_html__('Showing images with file types: %s. Convert one at a time with the row action, or tick multiple and use "Convert Selected".', 'webp-convert'),
-            '<strong>' . esc_html(strtoupper(implode(', ', $enabled))) . '</strong>'
+            '<strong>' . esc_html(strtoupper(implode(', ', $enabled))) . '</strong>',
         ) . '</p>';
 
         $query = new WP_Query([
@@ -243,8 +262,8 @@ class WebP_Convert_Admin_Pages
                         $file_name   = $file_path ? wp_basename($file_path) : get_the_title();
                         $mime        = get_post_mime_type($id);
                         $convert_url = wp_nonce_url(
-                            admin_url('admin.php?action=convert_webp&attachment_id=' . $id),
-                            'convert_webp_' . $id
+                            admin_url('admin.php?action=convert_webp&attachment_id=' . $id . '&webp_return=' . self::MANUAL_SLUG),
+                            'convert_webp_' . $id,
                         );
                         ?>
                         <tr>
@@ -278,7 +297,8 @@ class WebP_Convert_Admin_Pages
                                 </a>
                             </td>
                         </tr>
-                    <?php endwhile; wp_reset_postdata(); ?>
+                    <?php endwhile;
+        wp_reset_postdata(); ?>
                 </tbody>
             </table>
 
@@ -290,6 +310,36 @@ class WebP_Convert_Admin_Pages
             </div>
         </form>
 
+        <?php
+        $this->print_batch_progress_script(
+            'webp-manual-form',
+            self::MANUAL_SLUG,
+            'webp_convert_one',
+            __('Converting…', 'webp-convert'),
+            __('Done.', 'webp-convert'),
+            'webp_converted',
+            'webp_count',
+        );
+
+        echo '</div>';
+    }
+
+    /**
+     * Shared progress UI script for the batch pages (Manual Converter and
+     * Regenerate). Walks the checked attachment IDs one AJAX request at a time
+     * so long batches never hit max_execution_time, drives the progress bar/log,
+     * then reloads with the result query args the matching notice reads.
+     */
+    private function print_batch_progress_script(
+        string $form_id,
+        string $slug,
+        string $ajax_action,
+        string $progress_label,
+        string $done_label,
+        string $done_param,
+        string $count_param,
+    ): void {
+        ?>
         <script>
         (function () {
             var master = document.getElementById('webp-select-all');
@@ -301,18 +351,21 @@ class WebP_Convert_Admin_Pages
                 });
             }
 
-            var form  = document.getElementById('webp-manual-form');
+            var form  = document.getElementById(<?php echo wp_json_encode($form_id); ?>);
             var nonce = document.getElementById('webp-ajax-nonce');
             if (!form || !nonce || typeof window.fetch !== 'function') {
                 return;
             }
 
-            var box     = document.getElementById('webp-progress');
-            var label   = document.getElementById('webp-progress-label');
-            var bar     = document.getElementById('webp-progress-bar');
-            var current = document.getElementById('webp-progress-current');
-            var log     = document.getElementById('webp-progress-log');
-            var paged   = form.querySelector('input[name="paged"]').value || '1';
+            var box           = document.getElementById('webp-progress');
+            var label         = document.getElementById('webp-progress-label');
+            var bar           = document.getElementById('webp-progress-bar');
+            var current       = document.getElementById('webp-progress-current');
+            var log           = document.getElementById('webp-progress-log');
+            var paged         = form.querySelector('input[name="paged"]').value || '1';
+            var ajaxAction    = <?php echo wp_json_encode($ajax_action); ?>;
+            var progressLabel = <?php echo wp_json_encode($progress_label); ?>;
+            var doneLabel     = <?php echo wp_json_encode($done_label); ?>;
 
             function appendLog(text, color) {
                 var li = document.createElement('li');
@@ -322,9 +375,9 @@ class WebP_Convert_Admin_Pages
                 log.scrollTop = log.scrollHeight;
             }
 
-            function convertOne(id) {
+            function processOne(id) {
                 var body = new URLSearchParams();
-                body.append('action', 'webp_convert_one');
+                body.append('action', ajaxAction);
                 body.append('nonce', nonce.value);
                 body.append('attachment_id', String(id));
                 return fetch(ajaxurl, {
@@ -353,7 +406,7 @@ class WebP_Convert_Admin_Pages
                 current.textContent = '';
                 bar.value = 0;
                 bar.max = total;
-                label.textContent = '<?php echo esc_js(__('Converting…', 'webp-convert')); ?> 0 / ' + total;
+                label.textContent = progressLabel + ' 0 / ' + total;
                 box.style.display = 'block';
                 box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
@@ -361,7 +414,7 @@ class WebP_Convert_Admin_Pages
                 ids.forEach(function (id) {
                     chain = chain.then(function () {
                         current.textContent = '#' + id;
-                        return convertOne(id).then(function (res) {
+                        return processOne(id).then(function (res) {
                             done++;
                             var data = (res && res.data) || {};
                             var name = data.filename || ('#' + id);
@@ -373,30 +426,28 @@ class WebP_Convert_Admin_Pages
                                 appendLog('✗ ' + name + (data.message ? ' — ' + data.message : ''), '#d63638');
                             }
                             bar.value = done;
-                            label.textContent = '<?php echo esc_js(__('Converting…', 'webp-convert')); ?> ' + done + ' / ' + total;
+                            label.textContent = progressLabel + ' ' + done + ' / ' + total;
                         });
                     });
                 });
 
                 chain.then(function () {
                     current.textContent = '';
-                    label.textContent = '<?php echo esc_js(__('Done.', 'webp-convert')); ?> ' + succeeded + ' / ' + total + (failed ? ' (' + failed + ' failed)' : '');
+                    label.textContent = doneLabel + ' ' + succeeded + ' / ' + total + (failed ? ' (' + failed + ' failed)' : '');
                     var url = new URL(window.location.href);
-                    url.searchParams.set('page', '<?php echo esc_js(self::MANUAL_SLUG); ?>');
+                    url.searchParams.set('page', <?php echo wp_json_encode($slug); ?>);
                     url.searchParams.set('paged', paged);
-                    url.searchParams.set('webp_converted', '1');
-                    url.searchParams.set('webp_count', String(succeeded));
+                    url.searchParams.set(<?php echo wp_json_encode($done_param); ?>, '1');
+                    url.searchParams.set(<?php echo wp_json_encode($count_param); ?>, String(succeeded));
                     setTimeout(function () { window.location.href = url.toString(); }, 1200);
                 });
             });
         })();
         </script>
         <?php
-
-        echo '</div>';
     }
 
-    private function render_tablenav_pages(WP_Query $query, int $paged): void
+    private function render_tablenav_pages(WP_Query $query, int $paged, string $slug = self::MANUAL_SLUG): void
     {
         $total_items = (int) $query->found_posts;
         $total_pages = (int) $query->max_num_pages;
@@ -405,7 +456,7 @@ class WebP_Convert_Admin_Pages
             return;
         }
 
-        $base_url  = admin_url('admin.php?page=' . self::MANUAL_SLUG);
+        $base_url  = admin_url('admin.php?page=' . $slug);
         $first_url = add_query_arg('paged', 1, $base_url);
         $prev_url  = add_query_arg('paged', max(1, $paged - 1), $base_url);
         $next_url  = add_query_arg('paged', min($total_pages, $paged + 1), $base_url);
@@ -421,7 +472,7 @@ class WebP_Convert_Admin_Pages
                 <?php echo esc_html(sprintf(
                     /* translators: %s: formatted item count */
                     _n('%s item', '%s items', $total_items, 'webp-convert'),
-                    number_format_i18n($total_items)
+                    number_format_i18n($total_items),
                 )); ?>
             </span>
             <?php if ($total_pages > 1) : ?>
@@ -450,7 +501,7 @@ class WebP_Convert_Admin_Pages
         if ($disabled) {
             printf(
                 '<span class="tablenav-pages-navspan button disabled" aria-hidden="true">%s</span>',
-                $symbol // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- hard-coded entities.
+                $symbol, // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- hard-coded entities.
             );
             return;
         }
@@ -459,20 +510,31 @@ class WebP_Convert_Admin_Pages
             esc_attr($class),
             esc_url($url),
             esc_html($label),
-            $symbol // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- hard-coded entities.
+            $symbol, // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- hard-coded entities.
         );
     }
 
     public function row_action(array $actions, $post): array
     {
-        if (!current_user_can('upload_files') || !in_array(get_post_mime_type($post), $this->settings->get_convertible_mimes(), true)) {
+        if (!current_user_can('upload_files')) {
             return $actions;
         }
-        $url = wp_nonce_url(
-            admin_url('admin.php?action=convert_webp&attachment_id=' . $post->ID),
-            'convert_webp_' . $post->ID
-        );
-        $actions['webp_convert'] = '<a href="' . esc_url($url) . '">' . esc_html__('Convert to WebP', 'webp-convert') . '</a>';
+
+        $mime = get_post_mime_type($post);
+        if (in_array($mime, $this->settings->get_convertible_mimes(), true)) {
+            $url = wp_nonce_url(
+                admin_url('admin.php?action=convert_webp&attachment_id=' . $post->ID),
+                'convert_webp_' . $post->ID,
+            );
+            $actions['webp'] = '<a href="' . esc_url($url) . '">' . esc_html__('Convert to WebP', 'webp-convert') . '</a>';
+        } elseif ($mime === 'image/webp') {
+            $url = wp_nonce_url(
+                admin_url('admin.php?action=regenerate_webp&attachment_id=' . $post->ID),
+                'regenerate_webp_' . $post->ID,
+            );
+            $actions['webp_regenerate'] = '<a href="' . esc_url($url) . '">' . esc_html__('Regenerate WebP', 'webp-convert') . '</a>';
+        }
+
         return $actions;
     }
 
@@ -487,15 +549,54 @@ class WebP_Convert_Admin_Pages
         $ok       = $this->converter->manual_convert($id);
         $redirect = add_query_arg(
             ['webp_converted' => $ok ? 1 : 0, 'webp_count' => 1],
-            wp_get_referer() ?: admin_url('upload.php')
+            $this->row_action_redirect_base(),
         );
         wp_safe_redirect($redirect);
         exit;
     }
 
+    /**
+     * Format a byte count using decimal (SI) units — 1 KB = 1000 bytes — with one
+     * decimal place, matching what file managers, download dialogs, and `ls -lh`
+     * show. WordPress's size_format() uses binary units (1 KB = 1024 bytes), which
+     * reads ~2% smaller (e.g. 2604 bytes → "2.5 KB" instead of "2.6 KB").
+     */
+    private function format_file_size(int $bytes): string
+    {
+        if ($bytes < 1000) {
+            return $bytes . ' B';
+        }
+        $units = ['KB', 'MB', 'GB', 'TB'];
+        $value = (float) $bytes;
+        $unit  = -1;
+        do {
+            $value /= 1000;
+            $unit++;
+        } while ($value >= 1000 && $unit < count($units) - 1);
+
+        return round($value, 1) . ' ' . $units[$unit];
+    }
+
+    /**
+     * Where a per-row action returns after handling. When the link carried a
+     * `webp_return` hint pointing at one of this plugin's pages, go straight
+     * back there — this action is shared with the Media Library, so relying on
+     * the HTTP referer alone would drop users on upload.php when the browser
+     * omits the Referer header. Falls back to the referer, then the library.
+     */
+    private function row_action_redirect_base(): string
+    {
+        $return = isset($_GET['webp_return']) ? sanitize_key(wp_unslash($_GET['webp_return'])) : '';
+        if (in_array($return, [self::MANUAL_SLUG, self::REGEN_SLUG], true)) {
+            return admin_url('admin.php?page=' . $return);
+        }
+        return wp_get_referer() ?: admin_url('upload.php');
+    }
+
     public function register_bulk_action(array $actions): array
     {
-        $actions['convert_webp'] = __('Convert to WebP', 'webp-convert');
+        $actions['convert_webp']    = __('Convert to WebP', 'webp-convert');
+        $actions['regenerate_webp'] = __('Regenerate WebP', 'webp-convert');
         return $actions;
     }
 
@@ -516,7 +617,7 @@ class WebP_Convert_Admin_Pages
         }
         return add_query_arg(
             ['webp_converted' => 1, 'webp_count' => $count],
-            $redirect
+            $redirect,
         );
     }
 
@@ -534,5 +635,275 @@ class WebP_Convert_Admin_Pages
             : __('No images were converted. Check that the file is a JPEG or PNG and that the server supports WebP.', 'webp-convert');
 
         printf('<div class="notice %s is-dismissible"><p>%s</p></div>', esc_attr($class), esc_html($message));
+    }
+
+    /**
+     * AJAX endpoint: regenerate (re-encode at the current quality) a single
+     * already-converted WebP attachment. Called once per selected ID from the
+     * Regenerate page progress UI.
+     */
+    public function ajax_regenerate_one(): void
+    {
+        if (!current_user_can('upload_files')) {
+            wp_send_json_error(['message' => __('Insufficient permissions.', 'webp-convert')], 403);
+        }
+        check_ajax_referer('webp_ajax', 'nonce');
+
+        $id = isset($_POST['attachment_id']) ? (int) $_POST['attachment_id'] : 0;
+        if ($id <= 0) {
+            wp_send_json_error(['message' => __('Invalid attachment ID.', 'webp-convert')], 400);
+        }
+
+        $file     = get_attached_file($id);
+        $filename = $file ? wp_basename($file) : (string) $id;
+
+        if ($this->converter->regenerate_attachment($id)) {
+            clearstatcache();
+            if ($file && file_exists($file)) {
+                $filename .= ' (' . $this->format_file_size(filesize($file)) . ')';
+            }
+            wp_send_json_success([
+                'id'       => $id,
+                'filename' => $filename,
+            ]);
+        }
+
+        wp_send_json_error([
+            'id'       => $id,
+            'filename' => $filename,
+            'message'  => __('Regeneration failed.', 'webp-convert'),
+        ]);
+    }
+
+    /**
+     * Handle non-JS POST submissions from the Regenerate page. Runs on the
+     * page's `load-{hook}` action, before any output, so redirects work.
+     */
+    public function maybe_handle_regenerate(): void
+    {
+        if (empty($_POST['webp_action']) || $_POST['webp_action'] !== 'bulk_regenerate') {
+            return;
+        }
+        if (!current_user_can('upload_files')) {
+            return;
+        }
+        check_admin_referer('webp_regenerate', 'webp_nonce');
+
+        $ids = [];
+        if (!empty($_POST['ids']) && is_array($_POST['ids'])) {
+            $ids = array_map('intval', $_POST['ids']);
+        }
+
+        $count = 0;
+        foreach ($ids as $id) {
+            if ($id > 0 && $this->converter->regenerate_attachment($id)) {
+                $count++;
+            }
+        }
+
+        $paged = isset($_POST['paged']) ? max(1, (int) $_POST['paged']) : 1;
+
+        wp_safe_redirect(add_query_arg(
+            [
+                'page'                   => self::REGEN_SLUG,
+                'paged'                  => $paged,
+                'webp_regenerated' => 1,
+                'webp_regen_count' => $count,
+            ],
+            admin_url('admin.php'),
+        ));
+        exit;
+    }
+
+    public function handle_regenerate_row_action(): void
+    {
+        $id = isset($_GET['attachment_id']) ? (int) $_GET['attachment_id'] : 0;
+        if (!$id || !current_user_can('upload_files')) {
+            wp_die(esc_html__('Insufficient permissions.', 'webp-convert'));
+        }
+        check_admin_referer('regenerate_webp_' . $id);
+
+        $ok       = $this->converter->regenerate_attachment($id);
+        $redirect = add_query_arg(
+            ['webp_regenerated' => $ok ? 1 : 0, 'webp_regen_count' => 1],
+            $this->row_action_redirect_base(),
+        );
+        wp_safe_redirect($redirect);
+        exit;
+    }
+
+    public function handle_regenerate_bulk_action(string $redirect, string $action, array $ids): string
+    {
+        if ($action !== 'regenerate_webp') {
+            return $redirect;
+        }
+        if (!current_user_can('upload_files')) {
+            return $redirect;
+        }
+
+        $count = 0;
+        foreach ($ids as $id) {
+            if ($this->converter->regenerate_attachment((int) $id)) {
+                $count++;
+            }
+        }
+        return add_query_arg(
+            ['webp_regenerated' => 1, 'webp_regen_count' => $count],
+            $redirect,
+        );
+    }
+
+    public function regenerate_notice(): void
+    {
+        if (!isset($_GET['webp_regenerated'])) {
+            return;
+        }
+        $count = isset($_GET['webp_regen_count']) ? (int) $_GET['webp_regen_count'] : 0;
+        $ok    = (int) $_GET['webp_regenerated'] === 1;
+
+        $class   = $ok && $count ? 'notice-success' : 'notice-warning';
+        $message = $ok && $count
+            ? sprintf(_n('%d image regenerated.', '%d images regenerated.', $count, 'webp-convert'), $count)
+            : __('No images were regenerated. Make sure the selected items are already WebP.', 'webp-convert');
+
+        printf('<div class="notice %s is-dismissible"><p>%s</p></div>', esc_attr($class), esc_html($message));
+    }
+
+    public function render_regenerate_page(): void
+    {
+        if (!current_user_can('upload_files')) {
+            return;
+        }
+
+        $paged    = isset($_GET['paged']) ? max(1, (int) $_GET['paged']) : 1;
+        $per_page = 20;
+        $quality  = $this->settings->quality();
+
+        echo '<div class="wrap">';
+        echo '<h1>' . esc_html__('WebP Convert — Regenerate', 'webp-convert') . '</h1>';
+
+        echo '<p>' . sprintf(
+            /* translators: %d: current quality value (1-100) */
+            esc_html__('Re-encode already-converted WebP images at the current quality setting (%d). Regenerate one with the row action, or tick multiple and use "Regenerate Selected".', 'webp-convert'),
+            (int) $quality,
+        ) . '</p>';
+
+        echo '<div class="notice notice-warning inline" style="margin:12px 0;"><p>' . wp_kses(
+            __('<strong>Note:</strong> the original JPEG/PNG was replaced during conversion, so regeneration re-encodes from the existing WebP. Lowering the quality reduces file size; raising it cannot restore detail already lost.', 'webp-convert'),
+            ['strong' => []],
+        ) . '</p></div>';
+
+        $query = new WP_Query([
+            'post_type'      => 'attachment',
+            'post_status'    => 'inherit',
+            'post_mime_type' => 'image/webp',
+            'posts_per_page' => $per_page,
+            'paged'          => $paged,
+            'orderby'        => 'date',
+            'order'          => 'DESC',
+        ]);
+
+        if (!$query->have_posts()) {
+            echo '<p>' . esc_html__('No WebP images found. Convert some images first from the Manual Converter.', 'webp-convert') . '</p>';
+            echo '</div>';
+            return;
+        }
+        ?>
+
+        <form id="webp-regenerate-form" method="post" action="<?php echo esc_url(admin_url('admin.php?page=' . self::REGEN_SLUG . '&paged=' . $paged)); ?>">
+            <?php wp_nonce_field('webp_regenerate', 'webp_nonce'); ?>
+            <input type="hidden" name="webp_action" value="bulk_regenerate">
+            <input type="hidden" name="paged" value="<?php echo esc_attr((string) $paged); ?>">
+            <input type="hidden" id="webp-ajax-nonce" value="<?php echo esc_attr(wp_create_nonce('webp_ajax')); ?>">
+
+            <div id="webp-progress" style="display:none;margin:12px 0;padding:12px;background:#fff;border:1px solid #c3c4c7;border-left-width:4px;border-left-color:#2271b1;">
+                <p style="margin:0 0 8px 0;"><strong id="webp-progress-label"><?php esc_html_e('Regenerating…', 'webp-convert'); ?></strong></p>
+                <progress id="webp-progress-bar" value="0" max="100" style="width:100%;height:20px;"></progress>
+                <p id="webp-progress-current" style="margin:8px 0 0 0;color:#646970;font-style:italic;"></p>
+                <ul id="webp-progress-log" style="margin:8px 0 0 0;max-height:160px;overflow:auto;font-family:monospace;font-size:12px;"></ul>
+            </div>
+
+            <div class="tablenav top">
+                <div class="alignleft actions">
+                    <?php submit_button(__('Regenerate Selected', 'webp-convert'), 'primary', 'submit_bulk_top', false); ?>
+                </div>
+                <?php $this->render_tablenav_pages($query, $paged, self::REGEN_SLUG); ?>
+            </div>
+
+            <table class="wp-list-table widefat fixed striped">
+                <thead>
+                    <tr>
+                        <td class="manage-column column-cb check-column">
+                            <input type="checkbox" id="webp-select-all">
+                        </td>
+                        <th scope="col" style="width:80px;"><?php esc_html_e('Preview', 'webp-convert'); ?></th>
+                        <th scope="col"><?php esc_html_e('File', 'webp-convert'); ?></th>
+                        <th scope="col"><?php esc_html_e('Size', 'webp-convert'); ?></th>
+                        <th scope="col"><?php esc_html_e('Date', 'webp-convert'); ?></th>
+                        <th scope="col" style="width:120px;"><?php esc_html_e('Action', 'webp-convert'); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php
+                    while ($query->have_posts()) :
+                        $query->the_post();
+                        $id        = get_the_ID();
+                        $file_path = get_attached_file($id);
+                        $file_name = $file_path ? wp_basename($file_path) : get_the_title();
+                        $size      = ($file_path && file_exists($file_path)) ? $this->format_file_size(filesize($file_path)) : '—';
+                        $regen_url = wp_nonce_url(
+                            admin_url('admin.php?action=regenerate_webp&attachment_id=' . $id . '&webp_return=' . self::REGEN_SLUG),
+                            'regenerate_webp_' . $id,
+                        );
+                        ?>
+                        <tr>
+                            <th scope="row" class="check-column">
+                                <input type="checkbox" name="ids[]" value="<?php echo esc_attr((string) $id); ?>">
+                            </th>
+                            <td><?php echo wp_get_attachment_image($id, [60, 60], true); ?></td>
+                            <td>
+                                <strong><?php echo esc_html($file_name); ?></strong><br>
+                                <span class="row-actions">
+                                    <span class="edit">
+                                        <a href="<?php echo esc_url(get_edit_post_link($id)); ?>"><?php esc_html_e('Edit', 'webp-convert'); ?></a> |
+                                    </span>
+                                    <span class="view">
+                                        <a href="<?php echo esc_url(wp_get_attachment_url($id)); ?>" target="_blank" rel="noopener"><?php esc_html_e('View', 'webp-convert'); ?></a>
+                                    </span>
+                                </span>
+                            </td>
+                            <td><?php echo esc_html($size); ?></td>
+                            <td><?php echo esc_html(get_the_date()); ?></td>
+                            <td>
+                                <a href="<?php echo esc_url($regen_url); ?>" class="button button-small">
+                                    <?php esc_html_e('Regenerate', 'webp-convert'); ?>
+                                </a>
+                            </td>
+                        </tr>
+                    <?php endwhile;
+        wp_reset_postdata(); ?>
+                </tbody>
+            </table>
+
+            <div class="tablenav bottom">
+                <div class="alignleft actions">
+                    <?php submit_button(__('Regenerate Selected', 'webp-convert'), 'primary', 'submit_bulk_bottom', false); ?>
+                </div>
+                <?php $this->render_tablenav_pages($query, $paged, self::REGEN_SLUG); ?>
+            </div>
+        </form>
+
+        <?php
+        $this->print_batch_progress_script(
+            'webp-regenerate-form',
+            self::REGEN_SLUG,
+            'webp_regenerate_one',
+            __('Regenerating…', 'webp-convert'),
+            __('Done.', 'webp-convert'),
+            'webp_regenerated',
+            'webp_regen_count',
+        );
+
+        echo '</div>';
     }
 }

@@ -8,7 +8,7 @@ if (!defined('ABSPATH')) {
  * Core conversion engine. Turns Media Library JPEG/PNG attachments into WebP,
  * optionally replacing originals on disk + CDN. Also handles attachment cleanup.
  *
- * Replace mode (default, `webp_convert_replace_originals` filter defaults true):
+ * Replace mode (default, `webp_replace_originals` filter defaults true):
  *  - Rewrites `_wp_attached_file`, `post_mime_type` → `image/webp`,
  *    and metadata `file`/`sizes[].file` → `.webp`.
  *  - Deletes original JPEG/PNG from disk and W3TC CDN.
@@ -19,7 +19,7 @@ if (!defined('ABSPATH')) {
  */
 class WebP_Convert_Converter
 {
-    const META_KEY = '_webp_convert_sizes';
+    public const META_KEY = '_webp_sizes';
 
     /** @var WebP_Convert_Settings */
     private $settings;
@@ -27,12 +27,17 @@ class WebP_Convert_Converter
     /** @var WebP_Convert_W3TC_Integration */
     private $w3tc;
 
+    /** @var WebP_Convert_CDN_Invalidator */
+    private $cdn;
+
     public function __construct(
         WebP_Convert_Settings $settings,
-        WebP_Convert_W3TC_Integration $w3tc
+        WebP_Convert_W3TC_Integration $w3tc,
+        WebP_Convert_CDN_Invalidator $cdn,
     ) {
         $this->settings = $settings;
         $this->w3tc     = $w3tc;
+        $this->cdn      = $cdn;
     }
 
     public function register_hooks(): void
@@ -43,7 +48,7 @@ class WebP_Convert_Converter
 
     public function should_replace_originals(): bool
     {
-        return (bool) apply_filters('webp_convert_replace_originals', true);
+        return (bool) apply_filters('webp_replace_originals', true);
     }
 
     public function on_generate_metadata(array $metadata, int $attachment_id): array
@@ -115,6 +120,40 @@ class WebP_Convert_Converter
             $metadata = $this->replace_originals_with_webp($attachment_id, $metadata, $file);
         }
 
+        $metadata = $this->refresh_metadata_filesizes($attachment_id, $metadata);
+
+        return $metadata;
+    }
+
+    /**
+     * Recompute the `filesize` values stored in attachment metadata from the
+     * actual files on disk (full-size top-level + every thumbnail). WordPress
+     * (6.0+) shows the Media Library "File size" from this metadata, not from the
+     * file itself — so after we re-encode to WebP or regenerate at a new quality,
+     * it stays stale (e.g. showing the original PNG size) until this refreshes it.
+     */
+    private function refresh_metadata_filesizes(int $attachment_id, array $metadata): array
+    {
+        clearstatcache();
+
+        $file = get_attached_file($attachment_id);
+        if ($file && file_exists($file)) {
+            $metadata['filesize'] = (int) filesize($file);
+        }
+
+        if (!empty($metadata['sizes']) && is_array($metadata['sizes']) && $file) {
+            $dir = trailingslashit(dirname($file));
+            foreach ($metadata['sizes'] as $size => $info) {
+                if (empty($info['file'])) {
+                    continue;
+                }
+                $path = $dir . $info['file'];
+                if (file_exists($path)) {
+                    $metadata['sizes'][$size]['filesize'] = (int) filesize($path);
+                }
+            }
+        }
+
         return $metadata;
     }
 
@@ -137,6 +176,149 @@ class WebP_Convert_Converter
         }
 
         return true;
+    }
+
+    /**
+     * Re-encode an already-converted attachment's WebP files (full size + every
+     * thumbnail) in place at the current quality setting, then re-push them to
+     * the W3TC CDN.
+     *
+     * Applies only to attachments whose attached file is already .webp (i.e.
+     * converted in replace mode). The original JPEG/PNG no longer exists, so the
+     * re-encode reads from the existing WebP: a lower quality shrinks the files,
+     * a higher quality cannot restore detail already discarded.
+     *
+     * @return bool True if at least one WebP file was re-encoded.
+     */
+    public function regenerate_attachment(int $attachment_id): bool
+    {
+        $file = get_attached_file($attachment_id);
+        if (!$file || !preg_match('/\.webp$/i', $file)) {
+            return false;
+        }
+
+        $quality = $this->settings->quality();
+        $targets = [$file];
+
+        $metadata = wp_get_attachment_metadata($attachment_id);
+        if (!empty($metadata['sizes']) && is_array($metadata['sizes'])) {
+            $dir = trailingslashit(dirname($file));
+            foreach ($metadata['sizes'] as $info) {
+                if (empty($info['file']) || !preg_match('/\.webp$/i', $info['file'])) {
+                    continue;
+                }
+                $targets[] = $dir . $info['file'];
+            }
+        }
+
+        $changed = 0;
+        foreach (array_unique($targets) as $path) {
+            if (file_exists($path) && $this->reencode_webp_in_place($path, $quality)) {
+                $changed++;
+            }
+        }
+
+        if ($changed === 0) {
+            return false;
+        }
+
+        // Persist the new on-disk sizes so the Media Library "File size" (read
+        // from attachment metadata, not the file) reflects the re-encode.
+        $metadata = $this->refresh_metadata_filesizes($attachment_id, is_array($metadata) ? $metadata : []);
+        wp_update_attachment_metadata($attachment_id, $metadata);
+
+        // Re-upload the refreshed .webp files to the CDN (overwrite). Resolves
+        // the same webp paths the upload flow uses and no-ops without W3TC.
+        $this->w3tc->push_attachment_to_cdn($attachment_id);
+
+        // Bust CloudFront edges so the re-encoded .webp is served immediately
+        // (the S3 key was overwritten but edges still hold the prior copy).
+        $this->cdn->invalidate_attachment($attachment_id);
+
+        return true;
+    }
+
+    /**
+     * Re-encode a single .webp file in place at the given quality. Writes to a
+     * temp sibling first, then atomically replaces the original so a failed or
+     * partial encode never truncates the live file.
+     */
+    private function reencode_webp_in_place(string $path, int $quality): bool
+    {
+        $tmp   = $path . '.regen.webp';
+        $saved = $this->encode_webp_lossy($path, $tmp, $quality);
+        if ($saved === null || !file_exists($saved) || filesize($saved) < 1) {
+            if ($saved !== null && file_exists($saved)) {
+                @unlink($saved);
+            }
+            return false;
+        }
+
+        if (!@rename($saved, $path)) {
+            @copy($saved, $path);
+            @unlink($saved);
+        }
+
+        return true;
+    }
+
+    /**
+     * Re-encode a source image to LOSSY WebP at the given quality, bypassing
+     * WP_Image_Editor entirely.
+     *
+     * Required for Regenerate: WordPress's Imagick editor forces lossless output
+     * (quality 100 + webp:lossless) whenever the *source* WebP is itself lossless
+     * (see WP_Image_Editor_Imagick::set_quality() → wp_get_webp_info()). That
+     * silently discards the requested quality, so lowering it never shrinks the
+     * file. Encoding directly forces lossy so the Quality setting actually applies.
+     *
+     * GD is tried first (production runs GD, not Imagick), Imagick as a fallback.
+     * Both encode lossy here: GD's imagewebp() is always lossy, and we set
+     * webp:lossless=false explicitly on Imagick.
+     *
+     * @return string|null Target path on success, null on failure.
+     */
+    private function encode_webp_lossy(string $source, string $target, int $quality): ?string
+    {
+        if (function_exists('imagecreatefromwebp') && function_exists('imagewebp')) {
+            $img = @imagecreatefromwebp($source);
+            if ($img) {
+                imagealphablending($img, false);
+                imagesavealpha($img, true);
+                $ok = @imagewebp($img, $target, $quality); // GD WebP output is always lossy
+                imagedestroy($img);
+                if ($ok && file_exists($target) && filesize($target) > 0) {
+                    return $target;
+                }
+                if (file_exists($target)) {
+                    @unlink($target);
+                }
+            }
+        }
+
+        if (class_exists('Imagick')) {
+            try {
+                $im = new \Imagick($source);
+                $im->setImageFormat('webp');
+                $im->setOption('webp:lossless', 'false');
+                $im->setImageCompressionQuality($quality);
+                $ok = $im->writeImage($target);
+                $im->clear();
+                $im->destroy();
+                if ($ok && file_exists($target) && filesize($target) > 0) {
+                    return $target;
+                }
+                if (file_exists($target)) {
+                    @unlink($target);
+                }
+            } catch (\Throwable $e) {
+                if (file_exists($target)) {
+                    @unlink($target);
+                }
+            }
+        }
+
+        return null;
     }
 
     public function cleanup_webp_files(int $attachment_id): void
@@ -239,8 +421,34 @@ class WebP_Convert_Converter
             return null;
         }
 
-        $editor->set_quality($this->settings->quality());
+        return $this->save_webp($editor, $target, $this->settings->quality());
+    }
+
+    /**
+     * Save an image editor's current image as WebP at the given quality.
+     *
+     * Quality is routed through the wp_editor_set_quality filter rather than
+     * relying solely on $editor->set_quality(). When the editor was created
+     * from a JPEG/PNG source, set_quality() runs against the *source* mime type
+     * (for JPEG it even forces COMPRESSION_JPEG) and WordPress then encodes the
+     * WebP at its own default quality, discarding the value we passed. The
+     * filter supplies the quality WordPress actually uses when writing WebP, so
+     * it applies regardless of the source format.
+     *
+     * @return string|null Saved file path on success, null on failure.
+     */
+    private function save_webp($editor, string $target, int $quality): ?string
+    {
+        $apply_quality = static function ($default_quality, $mime_type) use ($quality) {
+            return 'image/webp' === $mime_type ? $quality : $default_quality;
+        };
+        add_filter('wp_editor_set_quality', $apply_quality, 10, 2);
+
+        $editor->set_quality($quality);
         $saved = $editor->save($target, 'image/webp');
+
+        remove_filter('wp_editor_set_quality', $apply_quality, 10);
+
         if (is_wp_error($saved) || empty($saved['path'])) {
             return null;
         }

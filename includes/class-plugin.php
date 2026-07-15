@@ -22,6 +22,9 @@ class WebP_Convert_Plugin
     /** @var WebP_Convert_W3TC_Integration */
     private $w3tc;
 
+    /** @var WebP_Convert_CDN_Invalidator */
+    private $cdn;
+
     /** @var WebP_Convert_Converter */
     private $converter;
 
@@ -35,7 +38,8 @@ class WebP_Convert_Plugin
     {
         $this->settings     = new WebP_Convert_Settings();
         $this->w3tc         = new WebP_Convert_W3TC_Integration();
-        $this->converter    = new WebP_Convert_Converter($this->settings, $this->w3tc);
+        $this->cdn          = new WebP_Convert_CDN_Invalidator($this->settings);
+        $this->converter    = new WebP_Convert_Converter($this->settings, $this->w3tc, $this->cdn);
         $this->url_rewriter = new WebP_Convert_URL_Rewriter();
         $this->admin_pages  = new WebP_Convert_Admin_Pages($this->settings, $this->converter);
     }
