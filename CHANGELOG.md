@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Extracted the Manual Converter's batch progress script into a shared `Admin_Pages::print_batch_progress_script()` reused by both the Manual Converter and Regenerate pages.
 
+## [1.0.3] - 2026-05-19
+
+### Fixed
+- Palette (indexed-color) PNGs no longer fatal the conversion with "Palette image not supported by webp". The converter detects palette PNGs via the IHDR color-type byte and promotes them to truecolor through raw GD before encoding.
+- A failed conversion no longer leaves a 0-byte `.webp` that short-circuits subsequent retries — `convert_file()` now treats empty target files as missing.
+
 ## [1.0.2] - 2026-04-17
 
 ### Changed
