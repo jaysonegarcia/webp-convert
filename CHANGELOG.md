@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Regenerate now honors the Quality setting even when the source WebP is lossless.** If a converted file was stored as lossless WebP (e.g. converted at quality 100, or a flat image), `WP_Image_Editor_Imagick::set_quality()` force-encodes it lossless (quality 100) and discards the requested quality, so lowering the setting and regenerating changed nothing. `reencode_webp_in_place()` now re-encodes directly via `Converter::encode_webp_lossy()` (GD first — matching production — then Imagick, both forced lossy), so the Quality setting reduces file size as expected. Verified: a lossless 4298-byte image regenerated at quality 10 → 2436 bytes. Added `tests/test-regenerate-quality.php`.
 - **Per-row Regenerate/Convert actions no longer redirect to the Media Library.** The row-action links on the Regenerate and Manual Converter pages share their handler with the Media Library, so they relied on the HTTP `Referer` to return — when the browser omitted it, users were dropped on `upload.php`. The links now carry an explicit `webp_return` hint and redirect back to the originating WebP Convert page.
 - **File sizes display in decimal (SI) units.** The Regenerate list and AJAX result now format sizes as decimal KB/MB with one decimal (e.g. 2604 bytes → "2.6 KB"), matching file managers and `ls -lh`. Previously `size_format()` used binary units and rounded to whole KB, showing "3 KB" for a 2.6 KB file.
+- **Palette (indexed-color) PNGs no longer fatal the conversion** with "Palette image not supported by webp". The converter detects palette PNGs via the IHDR color-type byte and promotes them to truecolor through raw GD before encoding.
+- **A failed conversion no longer leaves a 0-byte `.webp`** that short-circuits subsequent retries — `convert_file()` now treats empty target files as missing.
 
 ### Changed
 - Extracted the Manual Converter's batch progress script into a shared `Admin_Pages::print_batch_progress_script()` reused by both the Manual Converter and Regenerate pages.
@@ -49,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Animated PNG detection (skipped to preserve animation).
 - Filters: `webp_quality`, `webp_replace_originals`.
 
-[1.1.0]: https://github.com/jaysonegarcia/webp-convert/releases/tag/v1.1.0
-[1.0.2]: https://github.com/jaysonegarcia/webp-convert/releases/tag/v1.0.2
-[1.0.1]: https://github.com/jaysonegarcia/webp-convert/releases/tag/v1.0.1
-[1.0.0]: https://github.com/jaysonegarcia/webp-convert/releases/tag/v1.0.0
+[1.1.0]: https://github.com/jaysonegarcia/webp-convert/releases/tag/1.1.0
+[1.0.2]: https://github.com/jaysonegarcia/webp-convert/releases/tag/1.0.2
+[1.0.1]: https://github.com/jaysonegarcia/webp-convert/releases/tag/1.0.1
+[1.0.0]: https://github.com/jaysonegarcia/webp-convert/releases/tag/1.0.0
